@@ -1,0 +1,41 @@
+============================================================
+  Neural-HMM Validation Test
+============================================================
+
+[1] Generating data...
+  Train: 300 | Test: 30
+
+[2] Testing Bi-LSTM emission network...
+  Emission output shape: torch.Size([1, 300, 2])
+  Emission range: [-0.7420, -0.6466]
+  Prob sum (should ~1.0): [1.0, 1.0, 1.0, 1.0, 1.0]
+  Bi-LSTM emission OK
+
+[3] Testing NeuralHMM decoder (Scaled F-B + Log-Viterbi)...
+  Posterior range: [0.101843, 0.898157]
+  Log evidence per sample: ['-207.77', '-173.06', '-193.96', '-207.67']
+  Viterbi states observed (pre-training): {0}
+  NeuralHMM decoder OK
+
+[4] Training Neural-HMM (15 epochs)...
+  Training time: 360.9s
+  Final loss: 0.2072
+
+[5] Evaluating Neural-HMM...
+  Neural-HMM Viterbi accuracy: 0.9249
+  Neural-HMM Posterior accuracy: 0.9248
+  Viterbi states: {0, 1}
+  Posterior states: {0, 1}
+
+[6] Gaussian HMM baseline...
+  Gaussian HMM accuracy: 0.9258
+
+============================================================
+  COMPARISON
+============================================================
+  Gaussian HMM:     0.9258
+  Neural-HMM:       0.9249
+  Relative diff:    -0.1%
+  State diversity OK (2 states observed)
+
+All tests PASSED
