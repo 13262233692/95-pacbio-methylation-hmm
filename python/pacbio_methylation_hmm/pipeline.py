@@ -41,8 +41,8 @@ class PipelineConfig:
     batch_size: int = 32
     target_base: Optional[bytes] = b'C'
     normalize_ipd: bool = True
-    ipd_mean: float = 0.5
-    ipd_std: float = 0.8
+    ipd_mean: float = None
+    ipd_std: float = None
 
 
 class MethylationPipeline:
@@ -66,7 +66,17 @@ class MethylationPipeline:
     def _normalize_ipd(self, ipd: np.ndarray) -> np.ndarray:
         if not self.config.normalize_ipd:
             return ipd
-        return (ipd - self.config.ipd_mean) / (self.config.ipd_std + 1e-8)
+        ipd_f = ipd.astype(np.float64)
+        if self.config.ipd_mean is None or self.config.ipd_std is None:
+            median = np.median(ipd_f)
+            mad = np.median(np.abs(ipd_f - median))
+            sigma = 1.4826 * mad
+            if sigma < 1e-8:
+                sigma = np.std(ipd_f)
+            if sigma < 1e-8:
+                return np.zeros_like(ipd_f)
+            return (ipd_f - median) / sigma
+        return (ipd_f - self.config.ipd_mean) / (self.config.ipd_std + 1e-8)
 
     def _process_reads(
         self, reads: List[ReadData]

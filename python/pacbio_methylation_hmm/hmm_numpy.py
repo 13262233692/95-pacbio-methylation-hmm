@@ -1,6 +1,11 @@
 """
 Core HMM implementation for methylation detection (NumPy version).
 
+Numerically stable implementation using:
+  - Scaled Forward-Backward with per-step log-normalization
+  - Normalized Log-Viterbi with per-step max-subtraction
+  - Logsumexp with finite-guaranteed arithmetic
+
 States:
     - 0: Unmethylated (U)
     - 1: Methylated (M)
@@ -29,22 +34,24 @@ class HMMConfig:
 
     emission_vars: np.ndarray = field(default_factory=lambda: np.array([0.5, 1.0]))
 
-    use_log_space: bool = True
+    emission_log_var_clip: float = -50.0
 
     def __post_init__(self):
         self.initial_probs = np.asarray(self.initial_probs, dtype=np.float64)
         self.trans_probs = np.asarray(self.trans_probs, dtype=np.float64)
         self.emission_means = np.asarray(self.emission_means, dtype=np.float64)
         self.emission_vars = np.asarray(self.emission_vars, dtype=np.float64)
-
-        if self.use_log_space:
-            self.log_initial = np.log(self.initial_probs + 1e-300)
-            self.log_trans = np.log(self.trans_probs + 1e-300)
+        self.log_initial = np.log(self.initial_probs + 1e-300)
+        self.log_trans = np.log(self.trans_probs + 1e-300)
 
 
 class MethylationHMM:
     """
     Hidden Markov Model for methylation state decoding from PacBio IPD signals.
+
+    All core algorithms operate entirely in log-probability space:
+      - Forward-Backward: per-step logsumexp normalization prevents drift
+      - Viterbi: per-step max-subtraction keeps delta bounded near zero
     """
 
     STATE_UNMETHYLATED = 0
@@ -56,7 +63,7 @@ class MethylationHMM:
 
     def _validate_config(self):
         c = self.config
-        assert c.n_states == 2, "Currently only 2-state HMM is supported"
+        assert c.n_states == 2
         assert c.initial_probs.shape == (c.n_states,)
         assert c.trans_probs.shape == (c.n_states, c.n_states)
         assert c.emission_means.shape == (c.n_states,)
@@ -69,88 +76,165 @@ class MethylationHMM:
             mean = self.config.emission_means[s]
             var = self.config.emission_vars[s]
             log_probs[:, s] = -0.5 * (
-                np.log(2 * np.pi * var)
+                np.log(2.0 * np.pi * var)
                 + (observations - mean) ** 2 / var
             )
+        clip = self.config.emission_log_var_clip
+        np.clip(log_probs, clip, 0.0, out=log_probs)
         return log_probs
 
     @staticmethod
     def _logsumexp(a: np.ndarray, axis: Optional[int] = None, keepdims: bool = False) -> np.ndarray:
         a_max = np.max(a, axis=axis, keepdims=True)
         a_max_safe = np.where(np.isfinite(a_max), a_max, 0.0)
-        out = np.log(np.sum(np.exp(a - a_max_safe), axis=axis, keepdims=True))
+        sumexp = np.sum(np.exp(a - a_max_safe), axis=axis, keepdims=True)
+        sumexp = np.maximum(sumexp, 1e-300)
+        out = np.log(sumexp)
         result = a_max_safe + out
         if not keepdims:
             result = np.squeeze(result, axis=axis)
         return result
 
-    def forward(self, observations: np.ndarray, log_emission: Optional[np.ndarray] = None) -> Tuple[np.ndarray, float]:
+    def forward_scaled(
+        self, observations: np.ndarray, log_emission: Optional[np.ndarray] = None
+    ) -> Tuple[np.ndarray, np.ndarray, float]:
+        """
+        Scaled Forward algorithm with per-step log-normalization.
+
+        At each step t, after computing raw log_alpha, we subtract
+        logsumexp_j(log_alpha_raw[t,j]) so that the normalized values
+        sum to 1 in probability space. The scaling constants log_C are
+        accumulated to recover log P(O).
+
+        This prevents log_alpha from drifting to -1e5 for long sequences.
+
+        Returns:
+            log_alpha_hat: (T, n_states) normalized forward variables
+            log_C: (T,) per-step log normalization constants
+            log_evidence: log P(O) = sum(log_C)
+        """
         T = observations.shape[0]
+        S = self.config.n_states
         if log_emission is None:
             log_emission = self._gaussian_log_pdf(observations)
 
-        log_alpha = np.full((T, self.config.n_states), -np.inf, dtype=np.float64)
-        log_alpha[0] = self.config.log_initial + log_emission[0]
+        log_alpha_hat = np.zeros((T, S), dtype=np.float64)
+        log_C = np.zeros(T, dtype=np.float64)
+
+        log_alpha_hat[0] = self.config.log_initial + log_emission[0]
+        log_C[0] = self._logsumexp(log_alpha_hat[0])
+        log_alpha_hat[0] -= log_C[0]
 
         for t in range(1, T):
-            for j in range(self.config.n_states):
-                log_alpha[t, j] = log_emission[t, j] + self._logsumexp(
-                    log_alpha[t - 1] + self.config.log_trans[:, j]
+            for j in range(S):
+                log_alpha_hat[t, j] = log_emission[t, j] + self._logsumexp(
+                    log_alpha_hat[t - 1] + self.config.log_trans[:, j]
                 )
+            log_C[t] = self._logsumexp(log_alpha_hat[t])
+            log_alpha_hat[t] -= log_C[t]
 
-        log_evidence = float(self._logsumexp(log_alpha[-1]))
-        return log_alpha, log_evidence
+        log_evidence = float(np.sum(log_C))
+        return log_alpha_hat, log_C, log_evidence
 
-    def backward(self, observations: np.ndarray, log_emission: Optional[np.ndarray] = None) -> np.ndarray:
+    def backward_scaled(
+        self, observations: np.ndarray, log_C: np.ndarray,
+        log_emission: Optional[np.ndarray] = None
+    ) -> np.ndarray:
+        """
+        Scaled Backward algorithm using the same per-step normalization
+        constants log_C from the forward pass.
+
+        beta_hat[t, i] = logsumexp_j(log_A[i,j] + log_B[j](O[t+1]) + beta_hat[t+1, j]) + log_C[t+1]
+
+        The log_C[t+1] scaling keeps beta_hat bounded just like alpha_hat.
+
+        Returns:
+            log_beta_hat: (T, n_states) normalized backward variables
+        """
         T = observations.shape[0]
+        S = self.config.n_states
         if log_emission is None:
             log_emission = self._gaussian_log_pdf(observations)
 
-        log_beta = np.full((T, self.config.n_states), -np.inf, dtype=np.float64)
-        log_beta[-1] = 0.0
+        log_beta_hat = np.zeros((T, S), dtype=np.float64)
+        log_beta_hat[-1] = 0.0
 
         for t in range(T - 2, -1, -1):
-            for i in range(self.config.n_states):
-                log_beta[t, i] = self._logsumexp(
+            for i in range(S):
+                log_beta_hat[t, i] = self._logsumexp(
                     self.config.log_trans[i, :]
                     + log_emission[t + 1, :]
-                    + log_beta[t + 1, :]
+                    + log_beta_hat[t + 1, :]
                 )
+            log_beta_hat[t] += log_C[t + 1]
 
-        return log_beta
+        return log_beta_hat
 
     def compute_posterior(self, observations: np.ndarray) -> Tuple[np.ndarray, np.ndarray, float]:
-        log_emission = self._gaussian_log_pdf(observations)
-        log_alpha, log_evidence = self.forward(observations, log_emission)
-        log_beta = self.backward(observations, log_emission)
+        """
+        Compute posterior state probabilities using Scaled Forward-Backward.
 
-        log_posterior = log_alpha + log_beta - log_evidence
-        log_posterior = log_posterior - self._logsumexp(log_posterior, axis=1, keepdims=True)
-        posteriors = np.exp(log_posterior)
-        return posteriors, log_alpha, log_evidence
+        gamma[t, j] = alpha_hat[t, j] * beta_hat[t, j]
+                    / sum_j(alpha_hat[t, j] * beta_hat[t, j])
+
+        In log space:
+        log_gamma[t, j] = log_alpha_hat[t, j] + log_beta_hat[t, j]
+                        - logsumexp_j(log_alpha_hat[t, j] + log_beta_hat[t, j])
+
+        Because alpha_hat and beta_hat are kept near zero by per-step
+        normalization, their sum never drifts to catastrophic magnitudes.
+        """
+        log_emission = self._gaussian_log_pdf(observations)
+        log_alpha_hat, log_C, log_evidence = self.forward_scaled(observations, log_emission)
+        log_beta_hat = self.backward_scaled(observations, log_C, log_emission)
+
+        log_gamma = log_alpha_hat + log_beta_hat
+        log_gamma = log_gamma - self._logsumexp(log_gamma, axis=1, keepdims=True)
+        posteriors = np.exp(log_gamma)
+
+        return posteriors, log_alpha_hat, log_evidence
 
     def viterbi(self, observations: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Normalized Log-Viterbi algorithm.
+
+        At each step, after computing log_delta_raw, we subtract
+        max_j(log_delta_raw[t,j]) to keep values near zero.
+        This does NOT affect argmax or psi because it's a uniform shift,
+        but it prevents log_delta from drifting to -1e5 for long sequences.
+
+        The backtracking pointer psi is completely unaffected by normalization
+        because argmax_i(a_i + c) = argmax_i(a_i) for any constant c.
+
+        Returns:
+            states: (T,) most likely state sequence
+            log_delta_hat: (T, n_states) normalized Viterbi scores
+        """
         T = observations.shape[0]
+        S = self.config.n_states
         log_emission = self._gaussian_log_pdf(observations)
 
-        log_delta = np.full((T, self.config.n_states), -np.inf, dtype=np.float64)
-        psi = np.zeros((T, self.config.n_states), dtype=np.int32)
+        log_delta_hat = np.zeros((T, S), dtype=np.float64)
+        psi = np.zeros((T, S), dtype=np.int32)
 
-        log_delta[0] = self.config.log_initial + log_emission[0]
+        log_delta_hat[0] = self.config.log_initial + log_emission[0]
+        log_delta_hat[0] -= np.max(log_delta_hat[0])
 
         for t in range(1, T):
-            for j in range(self.config.n_states):
-                scores = log_delta[t - 1] + self.config.log_trans[:, j]
+            for j in range(S):
+                scores = log_delta_hat[t - 1] + self.config.log_trans[:, j]
                 psi[t, j] = int(np.argmax(scores))
-                log_delta[t, j] = scores[psi[t, j]] + log_emission[t, j]
+                log_delta_hat[t, j] = scores[psi[t, j]] + log_emission[t, j]
+
+            log_delta_hat[t] -= np.max(log_delta_hat[t])
 
         states = np.zeros(T, dtype=np.int32)
-        states[-1] = int(np.argmax(log_delta[-1]))
+        states[-1] = int(np.argmax(log_delta_hat[-1]))
 
         for t in range(T - 2, -1, -1):
             states[t] = psi[t + 1, states[t + 1]]
 
-        return states, log_delta
+        return states, log_delta_hat
 
     def predict(self, observations: np.ndarray, threshold: float = 0.5) -> dict:
         if observations.ndim == 1:
@@ -159,7 +243,7 @@ class MethylationHMM:
             return [self._predict_single(observations[i], threshold) for i in range(observations.shape[0])]
 
     def _predict_single(self, observations: np.ndarray, threshold: float) -> dict:
-        posteriors, log_alpha, log_evidence = self.compute_posterior(observations)
+        posteriors, log_alpha_hat, log_evidence = self.compute_posterior(observations)
         states = (posteriors[:, self.STATE_METHYLATED] >= threshold).astype(np.int32)
         viterbi_states, _ = self.viterbi(observations)
 
